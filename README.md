@@ -178,6 +178,9 @@ python3 anyvm.py --os ghostbsd                       # MATE (default)
 python3 anyvm.py --os ghostbsd --release 26.1-xfce
 python3 anyvm.py --os ghostbsd --release 26.1-gershwin
 
+python3 anyvm.py --os nextbsd --release continuous-desktop            # NextBSD Desktop Preview (amd64)
+python3 anyvm.py --os nextbsd --release continuous-desktop --arch aarch64
+
 # BlissOS (Android-x86): root ssh + the Android desktop on the VNC console
 # -v folder sync uses scp (the only backend the Android guest supports).
 python3 anyvm.py --os blissos                        # latest (16, Android 13)

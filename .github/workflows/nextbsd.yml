@@ -17,16 +17,17 @@ concurrency:
   cancel-in-progress: true
 
 # Coverage tracks nextbsd-builder (ALL_RELEASES = continuous,
-# continuous-aarch64). NextBSD publishes no versioned releases: one rolling
-# `continuous` tag is refreshed on every push to main, and each builder release
-# tag freezes one of those snapshots. Upstream started publishing an arm64
-# image next to amd64 on 2026-08-14; both come from the same snapshot.
+# continuous-aarch64, continuous-desktop, continuous-desktop-aarch64).
+# NextBSD publishes no versioned releases: upstream refreshes two rolling
+# prerelease tags, continuous-server (release `continuous` here) and
+# continuous-desktop, with live ISOs only, and each builder release tag
+# freezes one installed snapshot (nextbsd-builder v2.0.4 on, installed from
+# the ISO by upstream's own installer onto ZFS). The Desktop variant is
+# tested here too, like ghostbsd's desktop releases.
 #
-# The conf's VM_SYNC_METHODS is rsync,scp,nfs. No sshfs leg: the NEXTBSD
+# The confs' VM_SYNC_METHODS is rsync,scp,nfs,tar. No sshfs leg: the NEXTBSD
 # kernel is built NO_MODULES and the image ships no kldload, so fusefs cannot
-# be loaded and there is no /dev/fuse. nfs only works because the builder
-# bakes /etc/netconfig into the image (the curated /etc omits the RPC netid
-# table, and without it every mount dies with "Netconfig database not found").
+# be loaded and there is no /dev/fuse.
 jobs:
   test:
     if: >-
@@ -40,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        release: ["continuous"]
+        release: ["continuous", "continuous-desktop"]
         arch: ["", "aarch64"]
         runs: ["ubuntu-26.04"]
         sync: ["scp", "rsync", "nfs", "tar"]
