@@ -2895,7 +2895,8 @@ Options:
   --release <ver>        OS Release version (e.g., 15.0, 7.4).
                          If invalid or omitted, tries to detect from available releases.
   --arch <arch>          Architecture: x86_64, i386, aarch64, riscv64, sparc64, powerpc64,
-                         s390x, armv7 or loongarch64. Default: Host architecture.
+                         powerpc, alpha, s390x, armv7 or loongarch64. Default: Host
+                         architecture.
                          Single-arch guests override the host default: reactos
                          is i386, riscos is armv7, redox is x86_64.
   --mem <MB>             Memory size in MB (Default: 4096 when the host
@@ -4562,6 +4563,11 @@ def qemu_binary_name(arch):
         return "qemu-system-arm"
     if arch == "sparc64":
         return "qemu-system-sparc64"
+    if arch == "powerpc":
+        # 32-bit PowerPC (NetBSD/macppc on the mac99 machine).
+        return "qemu-system-ppc"
+    if arch == "alpha":
+        return "qemu-system-alpha"
     if arch in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
         # QEMU ships powerpc64 (big-endian) and powerpc64le (little-endian)
         # under the same qemu-system-ppc64 binary; -M pseries + -cpu picks
@@ -4616,8 +4622,10 @@ def apt_qemu_package(arch):
         return "qemu-system-arm"
     if arch == "sparc64":
         return "qemu-system-sparc"
-    if arch in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
+    if arch in ("powerpc", "powerpc64", "powerpc64le", "ppc64", "ppc64le"):
         return "qemu-system-ppc"
+    if arch == "alpha":
+        return "qemu-system-misc"
     if arch == "s390x":
         return "qemu-system-s390x"
     return "qemu-system-x86"
@@ -9463,17 +9471,54 @@ def main():
                   "boot on QEMU's bundled OpenBIOS).".format(
                       OPENBIOS_SPARC64_ASSET, builder_repo, config['builder']))
 
+    # A firmware image the builder publishes beside the image (profile
+    # "bios_asset"), for guests that need a firmware newer than the one the
+    # host's QEMU bundles. NetBSD/macppc: the OpenBIOS in QEMU < 11.1 cannot
+    # match the boot disk to the kernel's bootpath, so the installed system
+    # finds no root ("boot device: memory0"); netbsd-builder ships the
+    # OpenBIOS from QEMU 11.1. Passed via -bios in the arch branch below.
+    profile_bios_file = None
+    if guest_profile and guest_profile.get('bios_asset'):
+        bios_asset = guest_profile['bios_asset']
+        profile_bios_file = os.path.join(output_dir, bios_asset)
+        if not os.path.exists(profile_bios_file):
+            if not config['builder']:
+                fatal("{} needs {} from its builder release, but no builder "
+                      "version was resolved (pass --builder).".format(
+                          vm_name, bios_asset))
+            bios_url = "https://github.com/{}/releases/download/v{}/{}".format(
+                builder_repo, str(config['builder']).lstrip("v"), bios_asset)
+            if config.get('cachedir'):
+                rel_path = os.path.relpath(output_dir, working_dir)
+                cache_output_dir = os.path.join(config['cachedir'], rel_path)
+                if not os.path.exists(cache_output_dir):
+                    os.makedirs(cache_output_dir)
+                cached_bios = os.path.join(cache_output_dir, bios_asset)
+                if not os.path.exists(cached_bios):
+                    download_file(bios_url, cached_bios, config['debug'])
+                if os.path.exists(cached_bios):
+                    shutil.copy2(cached_bios, profile_bios_file)
+            else:
+                download_file(bios_url, profile_bios_file, config['debug'])
+        if not os.path.exists(profile_bios_file):
+            fatal("Could not download {} from {} v{}.".format(
+                bios_asset, builder_repo, config['builder']))
+
     # microvm guests (profile machine_type=microvm, e.g. netbsd 11.0-microvm)
     # boot by direct kernel load: there is no BIOS/bootloader on the microvm
     # machine, so the kernel is a separate release asset published by the
     # image's OWN builder (profile "kernel_asset"), fetched from the same
     # pinned release as the image -- never from the guest OS's own mirrors at
     # run time, and never from releases/latest.
+    # NetBSD/alpha uses the same mechanism: QEMU's clipper has no SRM console
+    # to boot the disk, so its kernel is a release asset too.
     microvm_kernel_file = None
-    if guest_profile and guest_profile.get('machine_type') == "microvm":
+    profile_kernel_file = None
+    if guest_profile and (guest_profile.get('machine_type') == "microvm"
+                          or guest_profile.get('kernel_asset')):
         kernel_asset = guest_profile.get('kernel_asset')
         if not kernel_asset or not guest_profile.get('kernel_append'):
-            fatal("Guest profile says machine_type=microvm but is missing "
+            fatal("Guest profile needs a kernel but is missing "
                   "kernel_asset/kernel_append -- the builder release is "
                   "malformed; re-check {}.profile.json".format(vm_name))
         microvm_kernel_file = os.path.join(output_dir, kernel_asset)
@@ -9500,9 +9545,14 @@ def main():
             else:
                 download_file(kernel_url, microvm_kernel_file, config['debug'])
         if not os.path.exists(microvm_kernel_file):
-            fatal("Could not download {} from {} v{} (a microvm guest cannot "
+            fatal("Could not download {} from {} v{} (this guest cannot "
                   "boot without its kernel asset).".format(
                       kernel_asset, builder_repo, config['builder']))
+        if guest_profile.get('machine_type') != "microvm":
+            # Only microvm changes the machine (no PCI, MMIO virtio); a
+            # kernel asset alone just replaces the bootloader.
+            profile_kernel_file = microvm_kernel_file
+            microvm_kernel_file = None
 
     vm_user = "user" if config['os'] == "haiku" else "root"
 
@@ -9769,6 +9819,11 @@ def main():
             elif platform.system() == "Darwin" and hvf_supported():
                 accel = "hvf"
     elif config['arch'] == "riscv64":
+        accel = "tcg"
+    elif config['arch'] in ("powerpc", "alpha"):
+        # mac99 and clipper are TCG-only on every host anyvm runs on. Pinned
+        # for the same reason as sparc64 below: the generic branch would pick
+        # kvm on an x86 host and skip the TCG boot-timeout bump.
         accel = "tcg"
     elif config['arch'] == "sparc64":
         # QEMU has no KVM (or any hardware) accelerator for sparc64 on any
@@ -10099,9 +10154,10 @@ def main():
         # longer match. Match the builder. Scoped to tribblix only; other
         # illumos distros are left on the virtio default.
         disk_if = "sata"
-    elif config['arch'] == "sparc64":
+    elif config['arch'] in ("sparc64", "powerpc", "alpha"):
         # QEMU sun4u only has the onboard CMD646 PCI IDE (the disk enumerates as
-        # wd0); there is no virtio bus. The image is built on IDE too.
+        # wd0); there is no virtio bus. The image is built on IDE too. The
+        # NetBSD/macppc and NetBSD/alpha images are built on IDE as well.
         disk_if = "ide"
     else:
         disk_if = "virtio"
@@ -10238,6 +10294,12 @@ def main():
         # without them.
         args_qemu.extend([
             "-drive", "file={},format=qcow2,if=sd".format(qcow_name)
+        ])
+    elif config['arch'] in ("powerpc", "alpha"):
+        # Primary IDE master -> wd0, as netbsd-builder installs it. Kept plain
+        # like the build's -drive: no TRIM over these emulated controllers.
+        args_qemu.extend([
+            "-drive", "file={},format=qcow2,if=ide,index=0".format(qcow_name)
         ])
     elif config['arch'] == "sparc64":
         # QEMU sun4u's CMD646 PCI IDE under TCG loses completion interrupts on
@@ -10885,6 +10947,35 @@ def main():
             "-cpu", scpu,
             "-device", "{},netdev=net0".format(net_card),
         ])
+    elif config['arch'] == "powerpc":
+        # NetBSD/macppc on QEMU mac99 (G4 + OpenBIOS), TCG only. graphics=off
+        # keeps OpenBIOS and the kernel on the serial console. OpenBIOS cannot
+        # read FFS: the image carries a small ISO9660 partition holding the
+        # kernel, and the profile's prom_env points boot-device at it
+        # (netbsd-builder hooks/host_afterInstall.sh).
+        args_qemu.extend([
+            "-machine", "mac99,graphics=off",
+            "-device", "{},netdev=net0".format(net_card),
+        ])
+        for pe in (guest_profile or {}).get('prom_env') or []:
+            args_qemu.extend(["-prom-env", pe])
+        if profile_bios_file:
+            args_qemu.extend(["-bios", profile_bios_file])
+    elif config['arch'] == "alpha":
+        # NetBSD/alpha on QEMU clipper, TCG only. No SRM console to boot the
+        # disk from, so the kernel is a release asset (profile kernel_asset)
+        # loaded directly. graphics=off puts the console on the serial port
+        # (PALcode HWRPB console type); the VGA adapter must stay, as the
+        # kernel takes a machine check probing the ISA bus without it.
+        if not profile_kernel_file:
+            fatal("{} has no kernel_asset in its profile; an alpha guest "
+                  "cannot boot from its disk.".format(vm_name))
+        args_qemu.extend([
+            "-machine", "clipper,graphics=off",
+            "-device", "{},netdev=net0".format(net_card),
+            "-kernel", profile_kernel_file,
+            "-append", guest_profile['kernel_append'],
+        ])
     elif config['arch'] == "sparc64":
         # QEMU sun4u (UltraSPARC IIi + OpenBIOS), TCG only. Console is on com0
         # serial -- the sun4u VGA only works in firmware -- so remove the VGA
@@ -11459,7 +11550,8 @@ def main():
         # Add audio support if the vnc driver is available (and not in console-only mode).
         # Skipped on sparc64: the sun4u machine has no slot for intel-hda/usb-audio.
         # Skipped on microvm: no PCI/USB bus for either audio device.
-        elif (not is_vnc_console and config['arch'] != "sparc64"
+        elif (not is_vnc_console
+                and config['arch'] not in ("sparc64", "powerpc", "alpha")
                 and check_qemu_audio_backend(qemu_bin, "vnc")):
             if config['arch'] == "aarch64":
                  # Use usb-audio on aarch64 to avoid intel-hda driver issues
@@ -11485,7 +11577,8 @@ def main():
         # Use appropriate input devices for better VNC support. sparc64 (sun4u)
         # has no USB controller, so usb-tablet would fail to attach; skip it (the
         # console is serial anyway). Same for microvm (no USB bus at all).
-        if (not is_vnc_console and config['arch'] != "sparc64"
+        if (not is_vnc_console
+                and config['arch'] not in ("sparc64", "powerpc", "alpha")
                 and not microvm_kernel_file):
             if config['arch'] == "aarch64":
                 args_qemu.extend(["-device", "usb-kbd", "-device", "virtio-tablet-pci"])
@@ -11532,7 +11625,7 @@ def main():
     # the sparc64 case: QEMU aborts at launch rather than merely confusing
     # the guest.
     if (config['os'] not in ("solaris", "reactos")
-            and config['arch'] not in ("sparc64", "armv7")):
+            and config['arch'] not in ("sparc64", "armv7", "powerpc", "alpha")):
         if config['arch'] == "s390x":
             rng_dev = "virtio-rng-ccw"
         elif microvm_kernel_file:
